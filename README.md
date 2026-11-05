@@ -108,7 +108,7 @@ The [current script][gist] already does all three.
 | `BID_PRICE` | `0.01` | Fixed max bid, $/hour/VM. |
 | `MIN_MEMORY` | `16Gi` | Nominal Spot RAM always kept won. |
 | `MAX_VMS` | `6` | Cap on won + in-flight VMs. |
-| `MAX_VMS_PER_REGION` | `0` | Per-region cap, 0 = unlimited. |
+| `MAX_VMS_PER_REGION` | `0` | Per-region cap on won + unfilled VMs, 0 = unlimited. Unfilled bids above it are withdrawn; won VMs are kept. `1` = one VM per region, bids spread over regions. |
 | `PROVISION_TIMEOUT` | `30m` | Unfilled bid → withdraw and fail over. |
 | `REGION_COOLDOWN` | `2h` | How long a failed region/class is skipped. |
 | `BOOT_GRACE` | `20m` | A won VM not yet Ready still absorbs pending pods for this long. |

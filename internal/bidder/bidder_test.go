@@ -460,3 +460,40 @@ func TestReconcileAppliesAndStopsOnError(t *testing.T) {
 		t.Fatalf("dry run applied %v", sp.applied)
 	}
 }
+
+// With one VM per region, a pool asking for 2 (1 won) gives up its unfilled
+// bid and the second VM is bid for in the next region instead.
+func TestMaxPerRegionSpreadsOneVMPerRegion(t *testing.T) {
+	s := settings()
+	s.MaxPerRegion = 1
+	sp := model.SpotState{
+		ServerClasses: catalog(),
+		Cloudspaces:   []model.Cloudspace{{Name: "spot-bidder-uk-lon-1", Region: "uk-lon-1", Managed: true, Created: t0}},
+		Pools: []model.Pool{
+			{Name: "a", Cloudspace: "spot-bidder-uk-lon-1", Region: "uk-lon-1", ServerClass: "ch.vs1.large-lon", Managed: true, Desired: 2, Won: 1, BidPrice: "0.01", IPs: []string{"10.0.0.1"}},
+		},
+	}
+	cl := model.ClusterState{SpotNodes: []model.SpotNode{readyNode("n1", "10.0.0.1", gi)}}
+	acts, _ := newBidder(s).Plan(t0, sp, cl)
+	want := []string{
+		"update-pool spot-bidder-uk-lon-1 ch.vs1.large-lon 1",
+		"create-cloudspace spot-bidder-us-east-iad-1  0",
+		"create-pool spot-bidder-us-east-iad-1 ch.vs1.large-iad 1",
+	}
+	if got := kinds(acts); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("actions:\n got %q\nwant %q", got, want)
+	}
+
+	// From empty, the 16Gi baseline lands as one VM in each of the two
+	// cheapest regions.
+	acts, _ = newBidder(s).Plan(t0, model.SpotState{ServerClasses: catalog()}, model.ClusterState{})
+	want = []string{
+		"create-cloudspace spot-bidder-uk-lon-1  0",
+		"create-pool spot-bidder-uk-lon-1 ch.vs1.large-lon 1",
+		"create-cloudspace spot-bidder-us-east-iad-1  0",
+		"create-pool spot-bidder-us-east-iad-1 ch.vs1.large-iad 1",
+	}
+	if got := kinds(acts); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("actions from empty:\n got %q\nwant %q", got, want)
+	}
+}

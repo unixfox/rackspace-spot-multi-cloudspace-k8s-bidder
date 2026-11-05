@@ -229,6 +229,27 @@ func (b *Bidder) Plan(now time.Time, sp model.SpotState, cl model.ClusterState) 
 			p.Won, p.Desired, now.Sub(since).Round(time.Minute), p.BidStatus, key, b.S.RegionCooldown))
 	}
 
+	// 2b. Per-region cap: withdraw unfilled bids beyond MaxPerRegion (e.g.
+	// a pool created before the cap was lowered). Won VMs are never removed.
+	if b.S.MaxPerRegion > 0 {
+		committed := map[string]int{}
+		for _, p := range counted {
+			committed[p.Region] += p.Won
+		}
+		for _, p := range managed {
+			committed[p.Region] += p.inFlight()
+		}
+		for _, p := range managed {
+			excess := min(p.inFlight(), committed[p.Region]-b.S.MaxPerRegion)
+			if excess <= 0 {
+				continue
+			}
+			committed[p.Region] -= excess
+			shrink(p, p.Desired-excess, fmt.Sprintf("MAX_VMS_PER_REGION=%d; withdrawing %d unfilled VM(s)",
+				b.S.MaxPerRegion, excess))
+		}
+	}
+
 	// 3. Current capacity.
 	readyIPs := map[string]bool{}
 	for _, n := range cl.SpotNodes {
