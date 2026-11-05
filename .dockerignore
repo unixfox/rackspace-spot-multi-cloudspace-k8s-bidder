@@ -1,0 +1,5 @@
+token
+deploy/
+.git
+.github
+*.md

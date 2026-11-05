@@ -1,0 +1,16 @@
+# Startup script given to every VM pool the bidder creates (Spot's
+# vmUserData). It must make the VM join the cluster as a spot node: taint
+# spot=true:NoSchedule and label capacity-type=spot (see SPOT_TAINT,
+# SPOT_NODE_SELECTOR, SPOT_NODE_LABELS in deployment.yaml).
+#
+# Only applies to pools created after a change; existing pools keep the
+# script they were created with.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spot-bidder
+  namespace: kube-system
+data:
+  user-data: |
+    #!/bin/bash
+    curl -fsSL https://gist.githubusercontent.com/unixfox/7e93f23e0d6eba9252354271aa49cda9/raw/script.sh | bash

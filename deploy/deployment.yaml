@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spot-bidder
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: spot-bidder
+spec:
+  # Exactly one bidder: two would both place bids for the same shortfall.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spot-bidder
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: spot-bidder
+    spec:
+      serviceAccountName: spot-bidder
+      # The bidder must not run on the spot capacity it manages: no
+      # toleration for the spot taint, and kept off spot nodes explicitly.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: capacity-type
+                    operator: NotIn
+                    values: ["spot"]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bidder
+          image: ghcr.io/unixfox/rackspace-spot-multi-cloudspace-k8s-bidder:latest
+          imagePullPolicy: Always
+          env:
+            - name: SPOT_ORG
+              value: "unixfox"
+            - name: SPOT_REFRESH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: spot-bidder
+                  key: SPOT_REFRESH_TOKEN
+            # Where and what to bid on. Regions are the Cost-Optimized ones
+            # minus Sydney and Hong Kong; order breaks price ties.
+            - name: REGIONS
+              value: "uk-lon-1,us-east-iad-1,us-central-ord-1,us-central-dfw-1"
+            - name: SERVER_CLASSES
+              value: "ch.vs1.large"
+            - name: BID_PRICE
+              value: "0.01"
+            # Nominal Spot RAM to always keep assigned, and a hard cap on VMs.
+            - name: MIN_MEMORY
+              value: "16Gi"
+            - name: MAX_VMS
+              value: "6"
+            # A bid not filled after PROVISION_TIMEOUT is withdrawn and that
+            # region/class is skipped for REGION_COOLDOWN.
+            - name: PROVISION_TIMEOUT
+              value: "30m"
+            - name: REGION_COOLDOWN
+              value: "2h"
+            - name: SCALE_DOWN_DELAY
+              value: "30m"
+            # Start in dry-run mode for a safe first rollout; flip to "false"
+            # once the logged "spot action" lines look right.
+            - name: DRY_RUN
+              value: "true"
+          volumeMounts:
+            - name: user-data
+              mountPath: /etc/spot-bidder
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: user-data
+          configMap:
+            name: spot-bidder
