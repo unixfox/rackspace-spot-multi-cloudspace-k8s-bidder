@@ -134,7 +134,8 @@ The [current script][gist] already does all three.
 
 1. The GitHub workflow builds and publishes
    `ghcr.io/unixfox/rackspace-spot-multi-cloudspace-k8s-bidder` (amd64 +
-   arm64) on every push; `latest` tracks the default branch.
+   arm64, each built natively in parallel then merged into one manifest) on
+   every push; `latest` tracks the default branch.
 2. Create the token Secret:
 
    ```bash
