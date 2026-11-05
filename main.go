@@ -60,6 +60,8 @@ func main() {
 	}
 	spotC := &spot.Client{
 		Spot:       spotClient,
+		HTTP:       spotClient.HTTPClient,
+		BaseURL:    cfg.SpotBaseURL,
 		Org:        cfg.SpotOrg,
 		NamePrefix: cfg.NamePrefix,
 		SSHKeyName: cfg.SSHKeyName,

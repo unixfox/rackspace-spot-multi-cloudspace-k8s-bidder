@@ -4,9 +4,13 @@
 package spot
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"strconv"
 	"strings"
 
@@ -24,7 +28,7 @@ type API interface {
 	ListVMCloudSpaces(ctx context.Context, org string) (*v1.VMCloudSpaceList, error)
 	CreateVMCloudSpace(ctx context.Context, vmcs v1.VMCloudSpace) error
 	DeleteVMCloudSpace(ctx context.Context, org, name string) error
-	CreateVMPool(ctx context.Context, org string, pool v1.VMPool) error
+	GetOrgID(ctx context.Context, orgNameOrID string) (bool, string, error)
 	UpdateVMPool(ctx context.Context, org string, pool v1.VMPool) error
 	DeleteVMPool(ctx context.Context, org, name string) error
 }
@@ -33,6 +37,8 @@ type API interface {
 // like.
 type Client struct {
 	Spot       API
+	HTTP       *http.Client // for calls the SDK gets wrong (see CreatePool)
+	BaseURL    string
 	Org        string
 	NamePrefix string // cloudspaces whose name starts with this are managed
 	SSHKeyName string
@@ -119,19 +125,62 @@ func (c *Client) CreateCloudspace(ctx context.Context, name, region string) erro
 }
 
 // CreatePool creates a spot VM pool in an existing cloudspace.
+//
+// This does not use the SDK's CreateVMPool: as of spot-go-sdk v0.2.1 it
+// omits spec.vmCloudSpaceRef, which the API now requires (HTTP 422
+// "spec.vmCloudSpaceRef in body must be of type object"). The body below
+// mirrors what the Spot console sends.
 func (c *Client) CreatePool(ctx context.Context, name, cloudspace, serverClass string, desired int, bid string) error {
-	err := c.Spot.CreateVMPool(ctx, c.Org, v1.VMPool{
-		Name:         name,
-		VMCloudSpace: cloudspace,
-		ServerClass:  serverClass,
-		Desired:      desired,
-		BidPrice:     bid,
-		PoolType:     "spot",
-		VMImage:      c.VMImage,
-		VMUserData:   v1.PrepareUserData(c.UserData),
+	wrap := func(err error) error {
+		return fmt.Errorf("spot: create VM pool %q (%s, desired %d) in %q: %w", name, serverClass, desired, cloudspace, err)
+	}
+	token, err := c.Spot.Authenticate(ctx)
+	if err != nil {
+		return wrap(fmt.Errorf("authenticate: %w", err))
+	}
+	exists, ns, err := c.Spot.GetOrgID(ctx, c.Org)
+	if err != nil {
+		return wrap(fmt.Errorf("resolve org %q: %w", c.Org, err))
+	}
+	if !exists {
+		return wrap(fmt.Errorf("organization %q not found", c.Org))
+	}
+
+	ref := map[string]string{"name": cloudspace, "namespace": ns}
+	body, err := json.Marshal(map[string]any{
+		"apiVersion": "ngpc.rxt.io/v1",
+		"kind":       "VMPool",
+		"metadata":   map[string]string{"name": name, "namespace": ns},
+		"spec": map[string]any{
+			"bidPrice":        bid,
+			"desired":         desired,
+			"poolType":        "spot",
+			"serverClass":     serverClass,
+			"vmCloudSpace":    cloudspace,
+			"vmCloudSpaceRef": ref,
+			"vmImage":         c.VMImage,
+			"vmUserData":      v1.PrepareUserData(c.UserData),
+		},
 	})
 	if err != nil {
-		return fmt.Errorf("spot: create VM pool %q (%s, desired %d) in %q: %w", name, serverClass, desired, cloudspace, err)
+		return wrap(err)
+	}
+
+	url := fmt.Sprintf("%s/apis/ngpc.rxt.io/v1/namespaces/%s/vmpools", c.BaseURL, ns)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return wrap(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return wrap(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return wrap(&v1.HTTPStatusError{StatusCode: resp.StatusCode, Body: string(msg)})
 	}
 	return nil
 }
