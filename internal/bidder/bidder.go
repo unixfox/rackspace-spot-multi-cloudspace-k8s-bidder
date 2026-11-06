@@ -20,16 +20,23 @@ import (
 
 // Settings is the planner's slice of the configuration.
 type Settings struct {
-	Regions       []string // allowed regions, in order of preference
-	Families      []string // server class families, in order of preference
-	BidPrice      string
-	NamePrefix    string
-	MinMemory     int64
-	MaxVMs        int
-	MaxPerRegion  int // 0 = unlimited
+	Regions      []string // allowed regions, in order of preference
+	Families     []string // server class families, in order of preference
+	BidPrice     string
+	NamePrefix   string
+	MinMemory    int64
+	MaxVMs       int
+	MaxPerRegion int // 0 = unlimited
+	// Race bids for the shortfall in every eligible region at once and
+	// withdraws the unfilled bids once servers are assigned, instead of
+	// placing each missing VM in the single best region.
+	Race bool
+	// Consolidate (race only) makes every region race to host the whole
+	// target alone, then keeps only the first region that does.
+	Consolidate   bool
 	AllocMemRatio float64
 
-	ProvisionTimeout time.Duration
+	ProvisionTimeout time.Duration // 0 = never give up on a region
 	RegionCooldown   time.Duration
 	BootGrace        time.Duration
 
@@ -219,7 +226,7 @@ func (b *Bidder) Plan(now time.Time, sp model.SpotState, cl model.ClusterState) 
 	// up its unfilled part, and its region/class cools down.
 	for _, p := range managed {
 		since, waiting := b.inflightSince[p.Name]
-		if !waiting || now.Sub(since) < b.S.ProvisionTimeout {
+		if !waiting || b.S.ProvisionTimeout <= 0 || now.Sub(since) < b.S.ProvisionTimeout {
 			continue
 		}
 		key := cooldownKey(p.Region, p.ServerClass)
@@ -304,7 +311,16 @@ func (b *Bidder) Plan(now time.Time, sp model.SpotState, cl model.ClusterState) 
 	}
 
 	diff := sum.Required - sum.InFlight
+	if b.S.Race {
+		target := b.fleetSize(cl, sizing, sum.PendingVMs)
+		a, none := b.race(now, sum.Required, target, offers, sp, managed, counted, readyIPs, shrink)
+		acts = append(acts, a...)
+		sum.NoOffering = none
+		diff = 0 // race handled bids and cancellations; only scale-down below applies
+	}
 	switch {
+	case b.S.Race && (sum.Required > 0 || sum.InFlight > 0):
+		b.lowUtilSince = time.Time{}
 	case diff > 0:
 		a, placed := b.place(now, diff, offers, sp, managed, perRegion)
 		acts = append(acts, a...)
@@ -407,6 +423,42 @@ func (b *Bidder) sizingClass(offers []model.ServerClass, sp model.SpotState) (mo
 	return best, found
 }
 
+// vmRoom is the room a new VM of class sc offers to workload pods: its
+// allocatable resources minus the largest DaemonSet footprint seen on a
+// Ready spot node.
+func (b *Bidder) vmRoom(cl model.ClusterState, sc model.ServerClass) model.Resources {
+	var overhead model.Resources
+	for _, n := range cl.SpotNodes {
+		if n.Ready {
+			overhead.MilliCPU = max(overhead.MilliCPU, n.DaemonSet.MilliCPU)
+			overhead.Memory = max(overhead.Memory, n.DaemonSet.Memory)
+		}
+	}
+	return model.Resources{
+		MilliCPU: sc.Resources.MilliCPU,
+		Memory:   int64(float64(sc.Resources.Memory) * b.S.AllocMemRatio),
+	}.Sub(overhead)
+}
+
+// fleetSize is how many VMs of class sc the cluster needs in total,
+// independent of how many are won: enough for MinMemory, or enough room
+// for the workload pods on spot nodes plus the new VMs pending pods need.
+func (b *Bidder) fleetSize(cl model.ClusterState, sc model.ServerClass, pendingVMs int) int {
+	fleet := int(ceilDiv(b.S.MinMemory, sc.Resources.Memory))
+	var used model.Resources
+	for _, n := range cl.SpotNodes {
+		if n.Ready {
+			used = used.Add(n.Requested.Sub(n.DaemonSet))
+		}
+	}
+	room := b.vmRoom(cl, sc)
+	usage := 0
+	if room.Memory > 0 && room.MilliCPU > 0 {
+		usage = int(max(ceilDiv(max(used.Memory, 0), room.Memory), ceilDiv(max(used.MilliCPU, 0), room.MilliCPU)))
+	}
+	return min(max(fleet, usage+pendingVMs), b.S.MaxVMs)
+}
+
 // packPending returns how many new VMs of class sc the pending pods need.
 // Pods that fit in the free room of an existing Ready spot node are not
 // capacity-bound (they are pending for another reason, or about to be
@@ -415,21 +467,14 @@ func (b *Bidder) packPending(cl model.ClusterState, sc model.ServerClass) (vms, 
 	if len(cl.Pending) == 0 {
 		return 0, 0
 	}
-	var overhead model.Resources
 	var bins []model.Resources // free room: existing nodes first, then new VMs
 	for _, n := range cl.SpotNodes {
-		if !n.Ready {
-			continue
+		if n.Ready {
+			bins = append(bins, n.Allocatable.Sub(n.Requested))
 		}
-		overhead.MilliCPU = max(overhead.MilliCPU, n.DaemonSet.MilliCPU)
-		overhead.Memory = max(overhead.Memory, n.DaemonSet.Memory)
-		bins = append(bins, n.Allocatable.Sub(n.Requested))
 	}
 	existing := len(bins)
-	newVM := model.Resources{
-		MilliCPU: sc.Resources.MilliCPU,
-		Memory:   int64(float64(sc.Resources.Memory) * b.S.AllocMemRatio),
-	}.Sub(overhead)
+	newVM := b.vmRoom(cl, sc)
 
 	pods := append([]model.Resources(nil), cl.Pending...)
 	sort.Slice(pods, func(i, j int) bool {
@@ -465,23 +510,8 @@ func (b *Bidder) packPending(cl model.ClusterState, sc model.ServerClass) (vms, 
 func (b *Bidder) place(now time.Time, n int, offers []model.ServerClass, sp model.SpotState,
 	managed []*pool, perRegion map[string]int) ([]Action, int) {
 
-	poolFor := func(sc model.ServerClass) *pool {
-		for _, p := range managed {
-			if p.Region == sc.Region && p.ServerClass == sc.Name && p.Desired > 0 {
-				return p
-			}
-		}
-		return nil
-	}
-	csName := func(region string) string { return b.S.NamePrefix + region }
-	csExists := map[string]bool{}
-	for _, cs := range sp.Cloudspaces {
-		if cs.Managed {
-			if _, gone := b.deleted[cs.Name]; !gone {
-				csExists[cs.Name] = true
-			}
-		}
-	}
+	csExists := b.liveManagedCloudspaces(sp)
+	poolFor := func(sc model.ServerClass) *pool { return poolFor(managed, sc) }
 
 	adds := map[string]int{} // serverclass -> VMs added this tick
 	waiting := func(sc model.ServerClass) bool {
@@ -499,9 +529,8 @@ func (b *Bidder) place(now time.Time, n int, offers []model.ServerClass, sp mode
 			if b.S.MaxPerRegion > 0 && perRegion[sc.Region] >= b.S.MaxPerRegion {
 				continue
 			}
-			name := csName(sc.Region)
-			if _, gone := b.deleted[name]; gone && !csExists[name] {
-				continue // our cloudspace there is still being deleted
+			if b.cloudspaceDeleting(sc.Region, csExists) {
+				continue
 			}
 			if best == nil || (!waiting(*sc) && waiting(*best)) {
 				best = sc
@@ -514,6 +543,16 @@ func (b *Bidder) place(now time.Time, n int, offers []model.ServerClass, sp mode
 		perRegion[best.Region]++
 	}
 
+	acts := b.grow(now, adds, offers, managed, csExists)
+	return acts, placed
+}
+
+// grow applies adds (serverclass -> extra VMs) by raising the desired count
+// of our pool for that class, or creating the pool (and its region's
+// cloudspace) when there is none.
+func (b *Bidder) grow(now time.Time, adds map[string]int, offers []model.ServerClass,
+	managed []*pool, csExists map[string]bool) []Action {
+
 	var acts []Action
 	for _, sc := range offers { // deterministic order
 		k := adds[sc.Name]
@@ -521,7 +560,7 @@ func (b *Bidder) place(now time.Time, n int, offers []model.ServerClass, sp mode
 			continue
 		}
 		reason := fmt.Sprintf("need %d more VM(s); market %.3f", k, sc.MarketPrice)
-		if p := poolFor(sc); p != nil {
+		if p := poolFor(managed, sc); p != nil {
 			if p.inFlight() == 0 {
 				b.inflightSince[p.Name] = now
 			}
@@ -530,7 +569,7 @@ func (b *Bidder) place(now time.Time, n int, offers []model.ServerClass, sp mode
 				Region: sc.Region, ServerClass: sc.Name, Desired: p.Desired, Bid: b.S.BidPrice, Reason: reason})
 			continue
 		}
-		cs := csName(sc.Region)
+		cs := b.S.NamePrefix + sc.Region
 		if !csExists[cs] {
 			acts = append(acts, Action{Kind: CreateCloudspace, Cloudspace: cs, Region: sc.Region, Reason: reason})
 			csExists[cs] = true
@@ -538,7 +577,161 @@ func (b *Bidder) place(now time.Time, n int, offers []model.ServerClass, sp mode
 		acts = append(acts, Action{Kind: CreatePool, Pool: b.NewName(), Cloudspace: cs, Region: sc.Region,
 			ServerClass: sc.Name, Desired: k, Bid: b.S.BidPrice, Reason: reason})
 	}
-	return acts, placed
+	return acts
+}
+
+// race keeps, in every eligible region at once, an unfilled bid for the
+// whole shortfall (bounded by MaxPerRegion), and withdraws every unfilled
+// bid as soon as the shortfall is covered by assigned servers. Whichever
+// regions actually assign servers first win. The second value reports that
+// capacity is needed but no region can take a bid.
+//
+// With Consolidate, every region instead races to host the whole target
+// fleet (see fleetSize) on its own. The first region that does becomes home: all
+// unfilled bids are withdrawn and, once home's servers are all Ready nodes,
+// our VMs in other regions are released, keeping inter-region traffic off
+// the mesh.
+func (b *Bidder) race(now time.Time, needed, target int, offers []model.ServerClass, sp model.SpotState,
+	managed, counted []*pool, readyIPs map[string]bool, shrink func(*pool, int, string)) ([]Action, bool) {
+
+	wonPerRegion := map[string]int{}
+	for _, p := range counted {
+		wonPerRegion[p.Region] += p.Won
+	}
+
+	if b.S.Consolidate && target > 0 {
+		if home := b.homeRegion(target, offers, wonPerRegion); home != "" {
+			b.consolidate(home, managed, counted, readyIPs, shrink)
+			return nil, false
+		}
+	}
+
+	csExists := b.liveManagedCloudspaces(sp)
+	adds := map[string]int{}
+	racing := map[*pool]bool{}
+	bidding := false
+	for _, sc := range offers {
+		if b.cloudspaceDeleting(sc.Region, csExists) {
+			continue
+		}
+		want := needed
+		if b.S.Consolidate {
+			want = target - wonPerRegion[sc.Region]
+		}
+		if b.S.MaxPerRegion > 0 {
+			want = min(want, b.S.MaxPerRegion-wonPerRegion[sc.Region])
+		}
+		want = max(want, 0)
+		if want > 0 {
+			bidding = true
+		}
+		p := poolFor(managed, sc)
+		cur := 0
+		if p != nil {
+			racing[p] = true
+			cur = p.inFlight()
+		}
+		switch {
+		case want > cur:
+			adds[sc.Name] = want - cur
+		case want < cur:
+			shrink(p, p.Desired-(cur-want), fmt.Sprintf("race: %d VM(s) still wanted here; withdrawing %d unfilled", want, cur-want))
+		}
+	}
+	// Pools outside the race (cooling down, above our bid, no longer
+	// configured) keep their bids while capacity is short, and drop them
+	// once it is not.
+	if needed == 0 && (!b.S.Consolidate || target == 0) {
+		for _, p := range managed {
+			if !racing[p] && p.inFlight() > 0 {
+				shrink(p, p.Won, "race: capacity met; withdrawing unfilled bid")
+			}
+		}
+	}
+	return b.grow(now, adds, offers, managed, csExists), needed > 0 && !bidding
+}
+
+// homeRegion returns the region whose assigned servers alone cover target
+// (most servers first, then offering order), or "" if none does.
+func (b *Bidder) homeRegion(target int, offers []model.ServerClass, wonPerRegion map[string]int) string {
+	home := ""
+	for _, r := range b.S.Regions {
+		if wonPerRegion[r] >= target && (home == "" || wonPerRegion[r] > wonPerRegion[home]) {
+			home = r
+		}
+	}
+	if home == "" {
+		return ""
+	}
+	// Among equally full regions prefer the cheapest offering.
+	for _, sc := range offers {
+		if wonPerRegion[sc.Region] == wonPerRegion[home] {
+			return sc.Region
+		}
+	}
+	return home
+}
+
+// consolidate withdraws every unfilled bid and, once all of home's servers
+// are Ready nodes (so evicted pods have somewhere to go), releases our VMs
+// in every other region.
+func (b *Bidder) consolidate(home string, managed, counted []*pool, readyIPs map[string]bool,
+	shrink func(*pool, int, string)) {
+
+	homeReady := true
+	for _, p := range counted {
+		if p.Region != home {
+			continue
+		}
+		if len(p.IPs) < p.Won {
+			homeReady = false
+		}
+		for _, ip := range p.IPs {
+			if !readyIPs[ip] {
+				homeReady = false
+			}
+		}
+	}
+	for _, p := range managed {
+		switch {
+		case p.Region != home && homeReady && p.Desired > 0:
+			shrink(p, 0, fmt.Sprintf("consolidating into %s; releasing %d VM(s) here", home, p.Won))
+		case p.inFlight() > 0:
+			why := fmt.Sprintf("%s holds the whole target; withdrawing unfilled bid", home)
+			if p.Region != home {
+				why += fmt.Sprintf(" (VMs here released once %s is Ready)", home)
+			}
+			shrink(p, p.Won, why)
+		}
+	}
+}
+
+func poolFor(managed []*pool, sc model.ServerClass) *pool {
+	for _, p := range managed {
+		if p.Region == sc.Region && p.ServerClass == sc.Name && p.Desired > 0 {
+			return p
+		}
+	}
+	return nil
+}
+
+// liveManagedCloudspaces returns our cloudspaces that are not being deleted.
+func (b *Bidder) liveManagedCloudspaces(sp model.SpotState) map[string]bool {
+	out := map[string]bool{}
+	for _, cs := range sp.Cloudspaces {
+		if _, gone := b.deleted[cs.Name]; cs.Managed && !gone {
+			out[cs.Name] = true
+		}
+	}
+	return out
+}
+
+// cloudspaceDeleting reports that our cloudspace in region is still being
+// deleted, so no new pool can be created there yet.
+func (b *Bidder) cloudspaceDeleting(region string, live map[string]bool) bool {
+	name := b.S.NamePrefix + region
+	_, gone := b.deleted[name]
+	return gone && !live[name]
 }
 
 // cancel withdraws n unfilled VMs, youngest bids first (no cooldown: the

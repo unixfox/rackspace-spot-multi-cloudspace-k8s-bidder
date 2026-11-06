@@ -36,8 +36,16 @@ type Config struct {
 	// Sizing.
 	MinMemoryRaw string `envconfig:"MIN_MEMORY" default:"16Gi"` // nominal Spot RAM to always keep won
 	MinMemory    int64  `ignored:"true"`
-	MaxVMs       int    `envconfig:"MAX_VMS" default:"6"`            // hard cap on won + in-flight VMs
-	MaxPerRegion int    `envconfig:"MAX_VMS_PER_REGION" default:"0"` // 0 = unlimited
+	MaxVMs       int    `envconfig:"MAX_VMS" default:"6"` // hard cap on won + in-flight VMs
+	// "spread": bid each missing VM in the best region, fail over on timeout.
+	// "race": bid for the shortfall in every region at once and withdraw
+	// the unfilled bids once servers are assigned.
+	BidStrategy string `envconfig:"BID_STRATEGY" default:"spread"`
+	// With BID_STRATEGY=race: every region races to host all VMs alone, and
+	// once one does the VMs elsewhere are released (saves inter-region
+	// bandwidth). Needs MAX_VMS_PER_REGION=0 or >= the VM count.
+	Consolidate  bool `envconfig:"CONSOLIDATE" default:"false"`
+	MaxPerRegion int  `envconfig:"MAX_VMS_PER_REGION" default:"0"` // 0 = unlimited
 	// Fraction of a VM's nominal RAM that ends up allocatable on the node
 	// (an 8GB ch.vs1.large reports ~7.26Gi allocatable).
 	AllocatableMemoryRatio float64 `envconfig:"ALLOCATABLE_MEMORY_RATIO" default:"0.9"`
@@ -110,8 +118,16 @@ func Load() (Config, error) {
 	if c.AllocatableMemoryRatio <= 0 || c.AllocatableMemoryRatio > 1 {
 		return c, fmt.Errorf("ALLOCATABLE_MEMORY_RATIO must be in (0,1], got %v", c.AllocatableMemoryRatio)
 	}
-	if c.Interval <= 0 || c.ProvisionTimeout <= 0 {
-		return c, fmt.Errorf("INTERVAL and PROVISION_TIMEOUT must be > 0")
+	if c.Interval <= 0 || c.ProvisionTimeout < 0 {
+		return c, fmt.Errorf("INTERVAL must be > 0 and PROVISION_TIMEOUT >= 0 (0 = never time out)")
+	}
+	switch c.BidStrategy = strings.ToLower(strings.TrimSpace(c.BidStrategy)); c.BidStrategy {
+	case "spread", "race":
+	default:
+		return c, fmt.Errorf("BID_STRATEGY must be \"spread\" or \"race\", got %q", c.BidStrategy)
+	}
+	if c.Consolidate && c.BidStrategy != "race" {
+		return c, fmt.Errorf("CONSOLIDATE requires BID_STRATEGY=race")
 	}
 
 	c.SpotTaint, err = parseTaint(c.SpotTaintRaw)

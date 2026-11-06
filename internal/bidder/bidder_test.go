@@ -539,3 +539,208 @@ func TestWonBidsWithoutServersTimeOutAndFailOver(t *testing.T) {
 		t.Fatalf("cooling down = %v", sum.CoolingDown)
 	}
 }
+
+func raceSettings() Settings {
+	s := settings()
+	s.Race = true
+	s.MaxPerRegion = 1
+	s.ProvisionTimeout = 0
+	return s
+}
+
+func racePool(region, suffix string, desired, won int, ips ...string) model.Pool {
+	return model.Pool{Name: "p-" + suffix, Cloudspace: "spot-bidder-" + region, Region: region,
+		ServerClass: "ch.vs1.large-" + suffix, Managed: true, Desired: desired, Won: won,
+		WonBids: desired, BidPrice: "0.01", IPs: ips}
+}
+
+func raceCloudspaces(regions ...string) []model.Cloudspace {
+	var out []model.Cloudspace
+	for _, r := range regions {
+		out = append(out, model.Cloudspace{Name: "spot-bidder-" + r, Region: r, Managed: true, Created: t0})
+	}
+	return out
+}
+
+// From empty, every allowed region (and not Sydney/Hong Kong) bids for one VM.
+func TestRaceBidsInEveryRegionAtOnce(t *testing.T) {
+	acts, sum := newBidder(raceSettings()).Plan(t0, model.SpotState{ServerClasses: catalog()}, model.ClusterState{})
+	var pools []string
+	for _, a := range acts {
+		if a.Kind == CreatePool {
+			pools = append(pools, fmt.Sprintf("%s=%d", a.ServerClass, a.Desired))
+		}
+	}
+	want := "[ch.vs1.large-lon=1 ch.vs1.large-iad=1 ch.vs1.large-ord=1 ch.vs1.large-dfw=1]"
+	if fmt.Sprint(pools) != want {
+		t.Fatalf("pools = %v, want %s", pools, want)
+	}
+	if sum.Required != 2 || sum.NoOffering {
+		t.Fatalf("required %d, no offering %v", sum.Required, sum.NoOffering)
+	}
+}
+
+// Two regions assign servers: the two still-unfilled bids are withdrawn.
+func TestRaceWithdrawsLosersOnceCapacityIsAssigned(t *testing.T) {
+	sp := model.SpotState{
+		ServerClasses: catalog(),
+		Cloudspaces:   raceCloudspaces("uk-lon-1", "us-east-iad-1", "us-central-ord-1", "us-central-dfw-1"),
+		Pools: []model.Pool{
+			racePool("uk-lon-1", "lon", 1, 0), // won bid stuck in "Reserving"
+			racePool("us-east-iad-1", "iad", 1, 1, "10.0.0.1"),
+			racePool("us-central-ord-1", "ord", 1, 1, "10.0.0.2"),
+			racePool("us-central-dfw-1", "dfw", 1, 0),
+		},
+	}
+	acts, _ := newBidder(raceSettings()).Plan(t0.Add(time.Hour), sp, model.ClusterState{})
+	want := []string{
+		"delete-pool spot-bidder-uk-lon-1 ch.vs1.large-lon 0",
+		"delete-pool spot-bidder-us-central-dfw-1 ch.vs1.large-dfw 0",
+		"delete-cloudspace spot-bidder-uk-lon-1  0",
+		"delete-cloudspace spot-bidder-us-central-dfw-1  0",
+	}
+	if got := kinds(acts); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("actions:\n got %q\nwant %q", got, want)
+	}
+}
+
+// One server assigned, one still needed: the other regions keep racing,
+// the winner's region is full (MAX_VMS_PER_REGION=1), and with
+// PROVISION_TIMEOUT=0 nothing ever times out.
+func TestRaceKeepsRacingWhileShortAndNeverTimesOut(t *testing.T) {
+	sp := model.SpotState{
+		ServerClasses: catalog(),
+		Cloudspaces:   raceCloudspaces("uk-lon-1", "us-east-iad-1", "us-central-ord-1", "us-central-dfw-1"),
+		Pools: []model.Pool{
+			racePool("uk-lon-1", "lon", 1, 0),
+			racePool("us-east-iad-1", "iad", 1, 1, "10.0.0.1"),
+			racePool("us-central-ord-1", "ord", 1, 0),
+			racePool("us-central-dfw-1", "dfw", 1, 0),
+		},
+	}
+	b := newBidder(raceSettings())
+	for _, at := range []time.Duration{0, 10 * time.Hour} {
+		acts, sum := b.Plan(t0.Add(at), sp, model.ClusterState{})
+		if len(acts) != 0 {
+			t.Fatalf("at +%s: unexpected actions %q", at, kinds(acts))
+		}
+		if sum.Won != 1 || sum.InFlight != 3 || len(sum.CoolingDown) != 0 {
+			t.Fatalf("at +%s: won %d in flight %d cooling %v", at, sum.Won, sum.InFlight, sum.CoolingDown)
+		}
+	}
+}
+
+// Without a per-region cap each region races for the whole shortfall.
+func TestRaceWithoutCapBidsWholeShortfallPerRegion(t *testing.T) {
+	s := raceSettings()
+	s.MaxPerRegion = 0
+	sp := model.SpotState{
+		ServerClasses: catalog(),
+		Cloudspaces:   raceCloudspaces("uk-lon-1"),
+		Pools:         []model.Pool{racePool("uk-lon-1", "lon", 1, 0)},
+	}
+	acts, _ := newBidder(s).Plan(t0, sp, model.ClusterState{})
+	got := kinds(acts)
+	if len(got) == 0 || got[0] != "update-pool spot-bidder-uk-lon-1 ch.vs1.large-lon 2" {
+		t.Fatalf("actions = %q", got)
+	}
+	if n := len(got); n != 7 { // lon update + 3 × (cloudspace + pool)
+		t.Fatalf("got %d actions: %q", n, got)
+	}
+}
+
+func consolidateSettings() Settings {
+	s := raceSettings()
+	s.MaxPerRegion = 0
+	s.Consolidate = true
+	return s
+}
+
+func nodes(ips ...string) model.ClusterState {
+	var cl model.ClusterState
+	for i, ip := range ips {
+		cl.SpotNodes = append(cl.SpotNodes, readyNode(fmt.Sprintf("n%d", i), ip, gi))
+	}
+	return cl
+}
+
+// Every region races to host the whole 16Gi (2 VMs) on its own.
+func TestConsolidateRacesWholeTargetPerRegion(t *testing.T) {
+	acts, _ := newBidder(consolidateSettings()).Plan(t0, model.SpotState{ServerClasses: catalog()}, model.ClusterState{})
+	var pools []string
+	for _, a := range acts {
+		if a.Kind == CreatePool {
+			pools = append(pools, fmt.Sprintf("%s=%d", a.ServerClass, a.Desired))
+		}
+	}
+	want := "[ch.vs1.large-lon=2 ch.vs1.large-iad=2 ch.vs1.large-ord=2 ch.vs1.large-dfw=2]"
+	if fmt.Sprint(pools) != want {
+		t.Fatalf("pools = %v, want %s", pools, want)
+	}
+}
+
+// Capacity is met but split over London and iad: keep racing for a region
+// that can hold both, release nothing yet.
+func TestConsolidateKeepsRacingWhileSplit(t *testing.T) {
+	sp := model.SpotState{
+		ServerClasses: catalog(),
+		Cloudspaces:   raceCloudspaces("uk-lon-1", "us-east-iad-1", "us-central-ord-1", "us-central-dfw-1"),
+		Pools: []model.Pool{
+			racePool("uk-lon-1", "lon", 2, 1, "10.0.0.1"),
+			racePool("us-east-iad-1", "iad", 2, 1, "10.0.0.2"),
+			racePool("us-central-ord-1", "ord", 2, 0),
+			racePool("us-central-dfw-1", "dfw", 2, 0),
+		},
+	}
+	acts, sum := newBidder(consolidateSettings()).Plan(t0, sp, nodes("10.0.0.1", "10.0.0.2"))
+	if len(acts) != 0 || sum.Won != 2 || sum.Required != 0 {
+		t.Fatalf("actions %q, won %d, required %d", kinds(acts), sum.Won, sum.Required)
+	}
+}
+
+// London now holds both VMs. While its second VM is still booting, only
+// the unfilled bids are withdrawn; once it is Ready, iad's VM is released.
+func TestConsolidateMovesToHomeRegionOnceReady(t *testing.T) {
+	sp := model.SpotState{
+		ServerClasses: catalog(),
+		Cloudspaces:   raceCloudspaces("uk-lon-1", "us-east-iad-1", "us-central-ord-1", "us-central-dfw-1"),
+		Pools: []model.Pool{
+			racePool("uk-lon-1", "lon", 2, 2, "10.0.0.1", "10.0.0.3"),
+			racePool("us-east-iad-1", "iad", 2, 1, "10.0.0.2"),
+			racePool("us-central-ord-1", "ord", 2, 0),
+			racePool("us-central-dfw-1", "dfw", 2, 0),
+		},
+	}
+	b := newBidder(consolidateSettings())
+
+	acts, _ := b.Plan(t0.Add(time.Hour), sp, nodes("10.0.0.1", "10.0.0.2")) // 10.0.0.3 still booting
+	want := []string{
+		"update-pool spot-bidder-us-east-iad-1 ch.vs1.large-iad 1",
+		"delete-pool spot-bidder-us-central-ord-1 ch.vs1.large-ord 0",
+		"delete-pool spot-bidder-us-central-dfw-1 ch.vs1.large-dfw 0",
+		"delete-cloudspace spot-bidder-us-central-ord-1  0",
+		"delete-cloudspace spot-bidder-us-central-dfw-1  0",
+	}
+	if got := kinds(acts); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("while home boots:\n got %q\nwant %q", got, want)
+	}
+
+	sp.Pools = sp.Pools[:2]
+	sp.Pools[1].Desired = 1
+	sp.Cloudspaces = sp.Cloudspaces[:2]
+	acts, _ = b.Plan(t0.Add(time.Hour+5*time.Minute), sp, nodes("10.0.0.1", "10.0.0.2", "10.0.0.3"))
+	want = []string{
+		"delete-pool spot-bidder-us-east-iad-1 ch.vs1.large-iad 0",
+		"delete-cloudspace spot-bidder-us-east-iad-1  0",
+	}
+	if got := kinds(acts); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("once home is ready:\n got %q\nwant %q", got, want)
+	}
+
+	// Settled: one region, nothing else to do.
+	sp.Pools = sp.Pools[:1]
+	sp.Cloudspaces = sp.Cloudspaces[:1]
+	if acts, _ := b.Plan(t0.Add(time.Hour+10*time.Minute), sp, nodes("10.0.0.1", "10.0.0.3")); len(acts) != 0 {
+		t.Fatalf("settled: unexpected actions %q", kinds(acts))
+	}
+}

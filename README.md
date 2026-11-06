@@ -67,6 +67,26 @@ Every `INTERVAL` (default `60s`) the bidder:
    - It keeps managed pools on `BID_PRICE` and deletes managed cloudspaces
      left without pools.
 
+**Bid strategies** (`BID_STRATEGY`):
+
+- `spread` (default) — the behaviour above: each missing VM goes to the best
+  region, with failover after `PROVISION_TIMEOUT`.
+- `race` — every eligible region bids for the whole shortfall at once
+  (bounded by `MAX_VMS_PER_REGION`); as soon as enough servers are
+  *assigned*, every unfilled bid is withdrawn. Pairs well with
+  `PROVISION_TIMEOUT=0` (never give up on a region; the others race it).
+- `race` + `CONSOLIDATE=true` — every region races to host the *whole* fleet
+  on its own (fleet = enough for `MIN_MEMORY`, or for the spot pods'
+  requests plus pending pods). Until one does, servers from several regions
+  are used together. The first region that holds the whole fleet becomes
+  home: unfilled bids are withdrawn, and once all home VMs are Ready nodes
+  the VMs in other regions are released, keeping spot traffic inside one
+  region. Use `MAX_VMS_PER_REGION=0`.
+
+Spot can report a bid as won (`wonCount`, "Fulfilled") while the cloudspace
+stays in "Provisioning/Reserving" for hours without a server, so only
+servers actually assigned to a cloudspace ever count as capacity.
+
 **Pricing.** Spot bills the *market price, up to your bid*, so the bidder
 always bids exactly `BID_PRICE` and simply avoids offerings whose market is
 above it.
@@ -109,7 +129,9 @@ The [current script][gist] already does all three.
 | `MIN_MEMORY` | `16Gi` | Nominal Spot RAM always kept won. |
 | `MAX_VMS` | `6` | Cap on won + in-flight VMs. |
 | `MAX_VMS_PER_REGION` | `0` | Per-region cap on won + unfilled VMs, 0 = unlimited. Unfilled bids above it are withdrawn; won VMs are kept. `1` = one VM per region, bids spread over regions. |
-| `PROVISION_TIMEOUT` | `30m` | Unfilled bid → withdraw and fail over. |
+| `BID_STRATEGY` | `spread` | `spread` or `race` (see above). |
+| `CONSOLIDATE` | `false` | With `race`: keep a single region once one holds the whole fleet. |
+| `PROVISION_TIMEOUT` | `30m` | Unfilled bid → withdraw and fail over; `0` = never. |
 | `REGION_COOLDOWN` | `2h` | How long a failed region/class is skipped. |
 | `BOOT_GRACE` | `20m` | A won VM not yet Ready still absorbs pending pods for this long. |
 | `PENDING_GRACE` | `60s` | A pod must be Unschedulable this long to count. |
