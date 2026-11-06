@@ -83,9 +83,18 @@ func (c *Client) State(ctx context.Context) (model.SpotState, error) {
 			Created: vmcs.CreationTimestamp,
 		})
 
+		// A pool's wonCount (and bidStatus "Fulfilled") only means the
+		// auction was won: Spot can then sit in "Provisioning/Reserving" for
+		// hours without allocating a server when the region has no physical
+		// capacity. Only servers actually assigned to the cloudspace count.
 		ips := map[string][]string{}
+		servers := map[string]int{}
 		for _, srv := range vmcs.AssignedServers {
-			if srv.NodePoolName != "" && srv.IPAddress != "" {
+			if srv.NodePoolName == "" {
+				continue
+			}
+			servers[srv.NodePoolName]++
+			if srv.IPAddress != "" {
 				ips[srv.NodePoolName] = append(ips[srv.NodePoolName], srv.IPAddress)
 			}
 		}
@@ -100,7 +109,8 @@ func (c *Client) State(ctx context.Context) (model.SpotState, error) {
 				ServerClass: p.ServerClass,
 				Managed:     managed,
 				Desired:     p.Desired,
-				Won:         p.WonCount,
+				Won:         servers[p.Name],
+				WonBids:     p.WonCount,
 				BidPrice:    p.BidPrice,
 				BidStatus:   p.BidStatus,
 				IPs:         ips[p.Name],

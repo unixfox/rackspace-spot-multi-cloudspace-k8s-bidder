@@ -44,7 +44,8 @@ type Pool struct {
 	ServerClass string
 	Managed     bool // created and owned by the bidder (cloudspace name has our prefix)
 	Desired     int
-	Won         int
+	Won         int // servers actually assigned (running or booting)
+	WonBids     int // Spot's wonCount: auctions won, allocated or not
 	BidPrice    string
 	BidStatus   string
 	IPs         []string // IP addresses of the servers currently assigned to this pool

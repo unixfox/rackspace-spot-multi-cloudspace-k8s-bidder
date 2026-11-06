@@ -497,3 +497,45 @@ func TestMaxPerRegionSpreadsOneVMPerRegion(t *testing.T) {
 		t.Fatalf("actions from empty:\n got %q\nwant %q", got, want)
 	}
 }
+
+// Night of 2026-11-05: London reported bidStatus "Fulfilled" / wonCount 2
+// but stayed "Provisioning/Reserving" for 8h with no server assigned. Won
+// bids without servers must count as in flight, time out, and fail over.
+func TestWonBidsWithoutServersTimeOutAndFailOver(t *testing.T) {
+	s := settings()
+	s.MaxPerRegion = 1
+	sp := model.SpotState{
+		ServerClasses: catalog(),
+		Cloudspaces:   []model.Cloudspace{{Name: "spot-bidder-uk-lon-1", Region: "uk-lon-1", Managed: true, Created: t0}},
+		Pools: []model.Pool{
+			{Name: "a", Cloudspace: "spot-bidder-uk-lon-1", Region: "uk-lon-1", ServerClass: "ch.vs1.large-lon", Managed: true,
+				Desired: 2, Won: 0, WonBids: 2, BidPrice: "0.01", BidStatus: "Fulfilled"},
+		},
+	}
+	b := newBidder(s)
+
+	// Not capacity: the cap trims London to 1 unfilled VM and the other
+	// is bid for in iad right away.
+	acts, sum := b.Plan(t0, sp, model.ClusterState{})
+	if sum.Won != 0 || sum.Booting != 0 {
+		t.Fatalf("won %d booting %d, want 0/0", sum.Won, sum.Booting)
+	}
+	want := []string{
+		"update-pool spot-bidder-uk-lon-1 ch.vs1.large-lon 1",
+		"create-cloudspace spot-bidder-us-east-iad-1  0",
+		"create-pool spot-bidder-us-east-iad-1 ch.vs1.large-iad 1",
+	}
+	if got := kinds(acts); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("actions:\n got %q\nwant %q", got, want)
+	}
+
+	// Still no server after the timeout: London is dropped and cools down.
+	sp.Pools[0].Desired = 1
+	acts, sum = b.Plan(t0.Add(31*time.Minute), sp, model.ClusterState{})
+	if got := kinds(acts); len(got) == 0 || got[0] != "delete-pool spot-bidder-uk-lon-1 ch.vs1.large-lon 0" {
+		t.Fatalf("actions = %q", got)
+	}
+	if len(sum.CoolingDown) != 1 || sum.CoolingDown[0] != "uk-lon-1/ch.vs1.large-lon" {
+		t.Fatalf("cooling down = %v", sum.CoolingDown)
+	}
+}

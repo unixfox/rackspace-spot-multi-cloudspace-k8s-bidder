@@ -225,8 +225,8 @@ func (b *Bidder) Plan(now time.Time, sp model.SpotState, cl model.ClusterState) 
 		key := cooldownKey(p.Region, p.ServerClass)
 		b.cooldownUntil[key] = now.Add(b.S.RegionCooldown)
 		sum.CoolingDown = append(sum.CoolingDown, key)
-		shrink(p, p.Won, fmt.Sprintf("only %d/%d servers after %s (bid status %q); cooling down %s for %s",
-			p.Won, p.Desired, now.Sub(since).Round(time.Minute), p.BidStatus, key, b.S.RegionCooldown))
+		shrink(p, p.Won, fmt.Sprintf("only %d/%d servers assigned after %s (bids won %d, bid status %q); cooling down %s for %s",
+			p.Won, p.Desired, now.Sub(since).Round(time.Minute), p.WonBids, p.BidStatus, key, b.S.RegionCooldown))
 	}
 
 	// 2b. Per-region cap: withdraw unfilled bids beyond MaxPerRegion (e.g.
